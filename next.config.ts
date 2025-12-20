@@ -11,8 +11,6 @@ const originalEmitWarning = process.emitWarning;
   return (originalEmitWarning as any)(warning, type, code);
 };
 
-const LOADER = path.resolve(__dirname, 'src/visual-edits/component-tagger-loader.js');
-
 const nextConfig: NextConfig = {
   images: {
     remotePatterns: [
@@ -26,7 +24,6 @@ const nextConfig: NextConfig = {
       },
     ],
   },
-  outputFileTracingRoot: path.resolve(__dirname, '../../'),
   
   // Configure webpack to handle PDF.js worker
   webpack: (config, { isServer }) => {
@@ -40,13 +37,16 @@ const nextConfig: NextConfig = {
     return config;
   },
   
-  turbopack: {
-    rules: {
-      "*.{jsx,tsx}": {
-        loaders: [LOADER]
+  // Only use turbopack in development
+  ...(process.env.NODE_ENV === 'development' && {
+    turbopack: {
+      rules: {
+        "*.{jsx,tsx}": {
+          loaders: [path.resolve(__dirname, 'src/visual-edits/component-tagger-loader.js')]
+        }
       }
     }
-  }
+  })
 };
 
 export default nextConfig;
