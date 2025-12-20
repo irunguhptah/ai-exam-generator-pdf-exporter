@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1759689740043,
+      "tag": "0000_ambitious_blade",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1759689849541,
+      "tag": "0001_medical_patriot",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1759697456295,
+      "tag": "0002_public_rumiko_fujikawa",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1762799021129,
+      "tag": "0003_pink_zarda",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1763336259351,
+      "tag": "0004_awesome_randall",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1764184226029,
+      "tag": "0005_add_scenario_format",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1765415011397,
+      "tag": "0006_outstanding_doomsday",
+      "breakpoints": true
+    }
+  ]
+}

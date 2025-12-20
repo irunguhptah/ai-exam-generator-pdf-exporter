@@ -1,0 +1,1 @@
+ALTER TABLE `exams` ADD `question_length` text DEFAULT 'medium' NOT NULL;

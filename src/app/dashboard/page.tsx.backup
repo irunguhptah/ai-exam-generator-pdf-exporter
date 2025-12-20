@@ -1,0 +1,1855 @@
+"use client";
+
+import { useState, useEffect } from "react";
+import { useSession } from "@/lib/auth-client";
+import { useRouter } from "next/navigation";
+
+// Utility function to safely access localStorage
+const getToken = () => typeof window !== 'undefined' ? localStorage.getItem("bearer_token") : null;
+
+// Helper function to detect high duplication risk scenarios
+const isHighDuplicationRisk = (questionLength: string, difficulty: string, numQuestions: number, model: string) => {
+  const isShortQuestions = questionLength === 'short';
+  const isEasyDifficulty = difficulty === 'easy';
+  const isHighVolume = numQuestions > 30;
+  const isWeakModel = !model.includes('70b') && !model.includes('8b');
+  
+  return isShortQuestions || isEasyDifficulty || isHighVolume || isWeakModel;
+};
+
+// Get risk factors for display
+const getRiskFactors = (questionLength: string, difficulty: string, numQuestions: number, model: string) => {
+  const factors = [];
+  if (questionLength === 'short') factors.push('Short questions');
+  if (difficulty === 'easy') factors.push('Easy difficulty');
+  if (numQuestions > 30) factors.push('High volume');
+  if (!model.includes('70b') && !model.includes('8b')) factors.push('Basic model');
+  return factors;
+};
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
+import {
+  Home,
+  History,
+  LogOut,
+  FileUp,
+  Sparkles,
+  Download,
+  Save,
+  X,
+  Printer,
+  FilterX,
+  AlertTriangle,
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Slider } from "@/components/ui/slider";
+import QuestionTable from "@/components/QuestionTable";
+import { removeDuplicates, DuplicationContext } from "@/lib/duplicate-detector";
+import { authClient } from "@/lib/auth-client";
+import { toast } from "sonner";
+import { Toaster } from "@/components/ui/sonner";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  extractTextFromFile,
+  extractTextFromMultipleFiles,
+} from "@/lib/file-parser";
+import {
+  logMemoryUsage,
+  isMemoryHighUsage,
+  forceGarbageCollection,
+} from "@/lib/memory-utils";
+import { FileDropzoneWithList } from "@/components/ui/file-dropzone";
+
+export default function DashboardPage() {
+  const { data: session, isPending } = useSession();
+  const router = useRouter();
+
+  const [examTitle, setExamTitle] = useState("");
+  const [subject, setSubject] = useState("");
+  const [coreTestingAreas, setCoreTestingAreas] = useState("");
+  const [difficulty, setDifficulty] = useState("hard");
+  const [questionLength, setQuestionLength] = useState("medium");
+  const [numQuestions, setNumQuestions] = useState(100);
+  const [context, setContext] = useState("");
+  const [sourceFiles, setSourceFiles] = useState<File[]>([]);
+  const [isProcessingFiles, setIsProcessingFiles] = useState(false);
+  const [selectedModel, setSelectedModel] = useState("openai/gpt-oss-120b");
+  const [questionTypes, setQuestionTypes] = useState({
+    multiple_choice: true,
+    true_false: false,
+    short_answer: false,
+  });
+
+  const [questions, setQuestions] = useState<any[]>([]);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [streamingStatus, setStreamingStatus] = useState<string>("");
+  const [streamingProgress, setStreamingProgress] = useState<number>(0);
+  const [questionsGenerated, setQuestionsGenerated] = useState<number>(0);
+  const [enableStreaming, setEnableStreaming] = useState<boolean>(true);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isRemovingDuplicates, setIsRemovingDuplicates] = useState(false);
+  const [loadedExamId, setLoadedExamId] = useState<number | null>(null);
+
+  // Load exam from sessionStorage if viewing from history
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const loadedExam = sessionStorage.getItem("loadedExam");
+      if (loadedExam) {
+        try {
+          const exam = JSON.parse(loadedExam);
+          console.log("Loading exam from sessionStorage:", exam);
+          console.log("Questions in loaded exam:", exam.questions?.length || 0);
+          setExamTitle(exam.title);
+          setSubject(exam.subject);
+          setCoreTestingAreas(exam.coreTestingAreas || '');
+          setDifficulty(exam.difficulty);
+          setQuestionLength(exam.questionLength || "medium");
+          setNumQuestions(exam.numQuestions);
+          setQuestions(exam.questions || []);
+          setLoadedExamId(exam.id);
+          sessionStorage.removeItem("loadedExam");
+          toast.success(
+            `Exam loaded successfully with ${exam.questions?.length || 0} questions`
+          );
+        } catch (error) {
+          console.error("Failed to load exam:", error);
+          toast.error("Failed to load exam");
+        }
+      }
+    }
+  }, []);
+
+  // Debug useEffect to track questions state changes
+  useEffect(() => {
+    console.log("Questions state changed:", questions);
+    console.log("Questions length:", questions.length);
+  }, [questions]);
+
+  // Memory monitoring and cleanup
+  useEffect(() => {
+    const interval = setInterval(() => {
+      logMemoryUsage("Dashboard");
+
+      if (isMemoryHighUsage()) {
+        console.warn("High memory usage detected");
+        // Force garbage collection if available
+        forceGarbageCollection();
+      }
+    }, 30000); // Check every 30 seconds
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Cleanup effect for component unmount
+  useEffect(() => {
+    return () => {
+      // Clear large context data on unmount but preserve questions
+      setContext("");
+      setSourceFiles([]);
+      forceGarbageCollection();
+    };
+  }, []);
+
+  const handleSignOut = async () => {
+    const token = getToken();
+    const { error } = await authClient.signOut({
+      fetchOptions: {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      },
+    });
+    if (error?.code) {
+      toast.error("Sign out failed");
+    } else {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem("bearer_token");
+      }
+      router.push("/");
+    }
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+
+    // Check total file size to prevent memory issues
+    const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+    const maxTotalSize = 100 * 1024 * 1024; // 100MB total limit
+
+    if (totalSize > maxTotalSize) {
+      toast.error(
+        `Total file size too large (${(totalSize / 1024 / 1024).toFixed(1)}MB). Maximum is 100MB.`
+      );
+      e.target.value = "";
+      return;
+    }
+
+    setIsProcessingFiles(true);
+    try {
+      // Process files one by one to reduce memory usage
+      const newFiles = [...sourceFiles];
+      let extractedText = context;
+
+      for (const file of files) {
+        try {
+          newFiles.push(file);
+          const fileText = await extractTextFromFile(file);
+
+          // Add file separator
+          const separator = `=== Source: ${file.name} ===\n\n`;
+          let newExtractedText = extractedText
+            ? `${extractedText}\n\n${separator}${fileText}\n\n`
+            : `${separator}${fileText}\n\n`;
+
+          // Check context size limit (1MB limit for context)
+          const maxContextSize = 1024 * 1024; // 1MB
+          if (newExtractedText.length > maxContextSize) {
+            // Truncate and show warning
+            newExtractedText =
+              newExtractedText.substring(0, maxContextSize) +
+              "\n\n... [Content truncated due to size limit] ...";
+            toast.warning(
+              `Context truncated due to size limit. Consider using fewer or smaller files.`
+            );
+          }
+
+          extractedText = newExtractedText;
+
+          // Update UI incrementally for better UX
+          setSourceFiles([...newFiles]);
+          setContext(extractedText);
+        } catch (fileError: any) {
+          console.error(`Failed to process ${file.name}:`, fileError);
+          toast.error(`Failed to process ${file.name}: ${fileError.message}`);
+          // Continue with other files
+        }
+      }
+
+      if (newFiles.length > sourceFiles.length) {
+        toast.success(
+          `Uploaded ${newFiles.length - sourceFiles.length} file(s) successfully`
+        );
+      }
+    } catch (error: any) {
+      // More specific error handling for PDF parsing issues
+      if (
+        error.message?.includes("pdf-parse") &&
+        error.message?.includes("PDF.js")
+      ) {
+        toast.error(
+          "PDF parsing failed. Please try a different PDF file or convert it to a text/DOCX format."
+        );
+      } else if (
+        error.message?.includes("worker") ||
+        error.message?.includes("fetch")
+      ) {
+        toast.error(
+          "Network issue while processing PDF. Please check your internet connection and try again."
+        );
+      } else if (error.message?.includes("too large")) {
+        toast.error(error.message);
+      } else {
+        toast.error(error.message || "Failed to process files");
+      }
+
+      // Remove the failed files from the list
+      setSourceFiles(sourceFiles);
+    } finally {
+      setIsProcessingFiles(false);
+      // Reset input to allow re-uploading same file
+      e.target.value = "";
+
+      // Force garbage collection hint
+      if (window.gc) {
+        window.gc();
+      }
+    }
+  };
+
+  const handleRemoveFile = async (index: number) => {
+    const newFiles = sourceFiles.filter((_, i) => i !== index);
+    setSourceFiles(newFiles);
+
+    if (newFiles.length === 0) {
+      setContext("");
+      toast.success("All files removed");
+    } else {
+      try {
+        setIsProcessingFiles(true);
+        const extractedText = await extractTextFromMultipleFiles(newFiles);
+        setContext(extractedText);
+        toast.success("File removed");
+      } catch (error: any) {
+        toast.error("Failed to reprocess files");
+      } finally {
+        setIsProcessingFiles(false);
+      }
+    }
+  };
+
+  const handleAutoSave = async (questionsToSave: any[]) => {
+    try {
+      const token = getToken();
+      const saveResponse = await fetch("/api/exams", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: examTitle,
+          subject,
+          coreTestingAreas,
+          difficulty,
+          questionLength,
+          numQuestions: questionsToSave.length,
+          questions: questionsToSave,
+        }),
+      });
+
+      const saveData = await saveResponse.json();
+
+      if (saveResponse.ok) {
+        setLoadedExamId(saveData.exam.id);
+        console.log("Exam auto-saved with ID:", saveData.exam.id);
+      } else {
+        console.error("Auto-save failed:", saveData.error);
+      }
+    } catch (error) {
+      console.error("Auto-save error:", error);
+    }
+  };
+
+  const handleGenerateQuestionsStreaming = async () => {
+    if (!examTitle || !subject || !coreTestingAreas.trim()) {
+      toast.error("Please fill in exam title, subject, and core testing areas");
+      return;
+    }
+
+    setIsStreaming(true);
+    setIsGenerating(true);
+    setStreamingStatus("Initializing...");
+    setStreamingProgress(0);
+    setQuestionsGenerated(0);
+    setQuestions([]); // Clear existing questions
+
+    try {
+      const selectedTypes = Object.entries(questionTypes)
+        .filter(([_, enabled]) => enabled)
+        .map(([type]) => type);
+
+      const token = getToken();
+      
+      // Start streaming request
+      const response = await fetch("/api/generate-questions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          subject,
+          difficulty,
+          questionLength,
+          numQuestions,
+          context,
+          coreTestingAreas: coreTestingAreas.trim(),
+          questionTypes: selectedTypes,
+          model: selectedModel,
+          stream: true, // Enable streaming
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      // Process Server-Sent Events
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (!reader) {
+        throw new Error("Failed to get response reader");
+      }
+
+      let accumulatedQuestions: any[] = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) {
+          break;
+        }
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.substring(6));
+              
+              switch (data.type) {
+                case 'status':
+                  setStreamingStatus(data.message);
+                  setStreamingProgress(data.progress || 0);
+                  break;
+                
+                case 'progress':
+                  setStreamingStatus(data.message);
+                  setStreamingProgress(data.progress || 0);
+                  setQuestionsGenerated(data.questionsGenerated || 0);
+                  break;
+                
+                case 'question':
+                  // Add new question to the list
+                  accumulatedQuestions.push(data.question);
+                  setQuestions([...accumulatedQuestions]);
+                  setQuestionsGenerated(accumulatedQuestions.length);
+                  break;
+                
+                case 'complete':
+                  setStreamingStatus("Generation complete!");
+                  setStreamingProgress(100);
+                  setQuestionsGenerated(data.totalQuestions || accumulatedQuestions.length);
+                  
+                  // Reset loadedExamId when generating new questions
+                  setLoadedExamId(null);
+                  
+                  toast.success(`Successfully generated ${accumulatedQuestions.length} questions!`);
+                  
+                  // Auto-save the exam
+                  await handleAutoSave(accumulatedQuestions);
+                  break;
+                
+                case 'error':
+                  throw new Error(data.message || 'Streaming error occurred');
+              }
+            } catch (parseError) {
+              console.error("Error parsing SSE data:", parseError);
+            }
+          }
+        }
+      }
+
+    } catch (error: any) {
+      console.error("Streaming generation error:", error);
+      toast.error(error.message || "Failed to generate questions");
+      setStreamingStatus("Generation failed");
+    } finally {
+      setIsStreaming(false);
+      setIsGenerating(false);
+    }
+  };
+
+  const handleGenerateQuestions = async () => {
+    if (!examTitle || !subject || !coreTestingAreas.trim()) {
+      toast.error("Please fill in exam title, subject, and core testing areas");
+      return;
+    }
+
+    setIsGenerating(true);
+    try {
+      const selectedTypes = Object.entries(questionTypes)
+        .filter(([_, enabled]) => enabled)
+        .map(([type]) => type);
+
+      const token = getToken();
+      const response = await fetch("/api/generate-questions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          subject,
+          difficulty,
+          questionLength,
+          numQuestions,
+          context,
+          coreTestingAreas: coreTestingAreas.trim(),
+          questionTypes: selectedTypes,
+          model: selectedModel,
+        }),
+      });
+
+      const data = await response.json();
+
+      // Always check for and display questions first, even if there's an error
+      if (
+        data.questions &&
+        Array.isArray(data.questions) &&
+        data.questions.length > 0
+      ) {
+        setQuestions(data.questions);
+        // Reset loadedExamId when generating new questions to allow saving
+        setLoadedExamId(null);
+
+        if (!response.ok) {
+          // Show error but keep the questions that were generated
+          toast.error(
+            `${data.error || "Partial generation error"} - Displaying ${data.questions.length} questions generated.`,
+            {
+              duration: 8000,
+            }
+          );
+        } else {
+          // Handle warnings for partial content
+          if (data.warning) {
+            toast.warning(data.warning, {
+              duration: 6000, // Show warning longer
+            });
+          } else {
+            toast.success(`Generated ${data.questions.length} questions!`);
+          }
+        }
+
+        // Automatically save the exam after successful generation
+        try {
+          const token = getToken();
+          const saveResponse = await fetch("/api/exams", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              title: examTitle,
+              subject,
+              coreTestingAreas,
+              difficulty,
+              questionLength,
+              numQuestions: data.questions.length,
+              questions: data.questions,
+            }),
+          });
+
+          const saveData = await saveResponse.json();
+
+          if (saveResponse.ok) {
+            setLoadedExamId(saveData.exam.id);
+            toast.success("Exam automatically saved!", {
+              duration: 3000,
+            });
+          }
+        } catch (saveError) {
+          console.error("Auto-save failed:", saveError);
+          // Don't show error toast for auto-save failure to avoid overwhelming user
+        }
+      } else if (!response.ok) {
+        // Only throw error if no questions were generated
+        throw new Error(data.error || "Failed to generate questions");
+      }
+    } catch (error: any) {
+      toast.error(error.message || "Failed to generate questions");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const handleSaveExam = async () => {
+    if (!examTitle || !subject || !coreTestingAreas.trim() || questions.length === 0) {
+      toast.error("Please fill in exam details and generate questions first");
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const token = getToken();
+      const response = await fetch("/api/exams", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: examTitle,
+          subject,
+          coreTestingAreas,
+          difficulty,
+          questionLength,
+          numQuestions: questions.length,
+          questions,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to save exam");
+      }
+
+      setLoadedExamId(data.exam.id);
+      toast.success("Exam saved successfully!");
+    } catch (error: any) {
+      toast.error(error.message || "Failed to save exam");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleRemoveDuplicates = async () => {
+    if (questions.length === 0) {
+      toast.error("No questions to check for duplicates");
+      return;
+    }
+
+    setIsRemovingDuplicates(true);
+    try {
+      // Create duplication context for adaptive thresholds
+      const duplicationContext: DuplicationContext = {
+        questionLength: questionLength as 'short' | 'medium' | 'long',
+        difficulty: difficulty,
+        modelStrength: selectedModel.includes('70b') ? 'strong' : 
+                      selectedModel.includes('8b') ? 'medium' : 'weak' as 'weak' | 'medium' | 'strong',
+        numQuestions: questions.length
+      };
+
+      const result = removeDuplicates(questions, duplicationContext);
+      
+      if (result.duplicatesRemoved > 0) {
+        setQuestions(result.unique);
+        toast.success(
+          `Removed ${result.duplicatesRemoved} duplicate question${
+            result.duplicatesRemoved === 1 ? "" : "s"
+          }. ${result.unique.length} unique questions remain.`
+        );
+      } else {
+        toast.info("No duplicates found. All questions are unique!");
+      }
+    } catch (error: any) {
+      toast.error("Failed to remove duplicates: " + (error.message || "Unknown error"));
+    } finally {
+      setIsRemovingDuplicates(false);
+    }
+  };
+
+  const handleExportPDF = async (version: "student" | "teacher") => {
+    if (!questions.length) {
+      toast.error("No questions to export");
+      return;
+    }
+
+    setIsExporting(true);
+    try {
+      const token = getToken();
+      const response = await fetch("/api/export-pdf", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          examTitle,
+          subject,
+          coreTestingAreas,
+          difficulty,
+          questionLength,
+          questions,
+          includeAnswers: version === "teacher",
+          version,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Failed to export PDF");
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${examTitle.replace(/[^a-z0-9]/gi, "_")}_${version}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+
+      // Delay cleanup to ensure download starts
+      setTimeout(() => {
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+      }, 100);
+
+      toast.success(
+        `${version === "student" ? "Student" : "Teacher"} PDF exported successfully`
+      );
+    } catch (error: any) {
+      toast.error(error.message || "Failed to export PDF");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handlePrint = async (version: "student" | "teacher" | "combined") => {
+    if (!questions.length) {
+      toast.error("No questions to print");
+      return;
+    }
+
+    try {
+      const token = getToken();
+      
+      // For combined version, we need to make two API calls
+      if (version === "combined") {
+        // Generate both student and teacher versions
+        const [studentResponse, teacherResponse] = await Promise.all([
+          fetch("/api/export-pdf", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              examTitle,
+              subject,
+              coreTestingAreas,
+              difficulty,
+              questionLength,
+              questions,
+              includeAnswers: false,
+              version: "student",
+            }),
+          }),
+          fetch("/api/export-pdf", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              examTitle,
+              subject,
+              coreTestingAreas,
+              difficulty,
+              questionLength,
+              questions,
+              includeAnswers: true,
+              version: "teacher",
+            }),
+          })
+        ]);
+
+        if (!studentResponse.ok || !teacherResponse.ok) {
+          throw new Error("Failed to generate print versions");
+        }
+
+        const [studentBlob, teacherBlob] = await Promise.all([
+          studentResponse.blob(),
+          teacherResponse.blob()
+        ]);
+
+        // Open both PDFs in new windows for printing
+        const studentUrl = window.URL.createObjectURL(studentBlob);
+        const teacherUrl = window.URL.createObjectURL(teacherBlob);
+        
+        const studentWindow = window.open(studentUrl, "_blank");
+        const teacherWindow = window.open(teacherUrl, "_blank");
+        
+        if (studentWindow) studentWindow.focus();
+        if (teacherWindow) teacherWindow.focus();
+        
+        toast.success("Generated student and teacher versions for printing");
+        
+        // Cleanup URLs after a delay
+        setTimeout(() => {
+          window.URL.revokeObjectURL(studentUrl);
+          window.URL.revokeObjectURL(teacherUrl);
+        }, 1000);
+        
+      } else {
+        // Single version
+        const includeAnswers = version === "teacher";
+        
+        const response = await fetch("/api/export-pdf", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            examTitle,
+            subject,
+            coreTestingAreas,
+            difficulty,
+            questionLength,
+            questions,
+            includeAnswers,
+            version,
+          }),
+        });
+
+        if (!response.ok) {
+          throw new Error("Failed to generate print version");
+        }
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        
+        // Open PDF in new window for printing
+        const printWindow = window.open(url, "_blank");
+        if (printWindow) {
+          printWindow.focus();
+          toast.success(`Generated ${version} version for printing`);
+        } else {
+          toast.error("Could not open print window. Please check popup blockers.");
+        }
+        
+        // Cleanup URL after a delay
+        setTimeout(() => {
+          window.URL.revokeObjectURL(url);
+        }, 1000);
+      }
+      
+    } catch (error: any) {
+      console.error("Print generation error:", error);
+      toast.error(error.message || "Failed to generate print version");
+    }
+  };
+
+
+    // Use the same export API for consistent styling
+    try {
+      const exportResponse = await fetch("/api/export-pdf", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          examId: exam.id,
+          version,
+          title: cleanTitle,
+          university: exam.university,
+          coreTestingAreas: exam.coreTestingAreas,
+          questions: questionsToShow.map(q => ({
+            id: q.id,
+            question: q.question,
+            options: q.options,
+            correctAnswer: q.correctAnswer,
+            explanation: q.explanation
+          }))
+        }),
+      });
+
+      if (!exportResponse.ok) {
+        throw new Error("Failed to generate PDF");
+      }
+
+      const blob = await exportResponse.blob();
+      const url = window.URL.createObjectURL(blob);
+      
+      // Create a temporary iframe for printing
+      const iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = url;
+      
+      document.body.appendChild(iframe);
+      
+      iframe.onload = () => {
+        setTimeout(() => {
+          if (iframe.contentWindow) {
+            iframe.contentWindow.print();
+          }
+          // Clean up after printing
+          setTimeout(() => {
+            document.body.removeChild(iframe);
+            window.URL.revokeObjectURL(url);
+          }, 1000);
+        }, 250);
+      };
+
+    } catch (error) {
+      console.error("Error printing exam:", error);
+      toast.error("Failed to print exam. Please try again.");
+      return;
+    }
+
+    toast.success(
+      `${version === "student" ? "Student" : version === "teacher" ? "Teacher" : "Teacher and Student"} version sent to printer`
+    );
+  };
+
+  return (
+    <SidebarProvider>
+      <div className="flex min-h-screen w-full">
+        <Sidebar>
+          <SidebarContent>
+            <div className="p-4 border-b">
+              <h2 className="text-xl font-bold flex items-center gap-2">
+                <Sparkles className="h-5 w-5" />
+                ExamForge
+              </h2>
+            </div>
+            <SidebarGroup>
+              <SidebarGroupLabel>Navigation</SidebarGroupLabel>
+              <SidebarGroupContent>
+              margin: 0;
+              line-height: 1.4;
+              background-color: #fafafa;
+              width: 100%;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+
+
+
+
+            /* Content container with full width */
+            .content-container {
+              width: 100%;
+              padding: 20px;
+              margin: 0 auto;
+            }
+
+            /* Header styling */
+            .header {
+              background: linear-gradient(135deg, #1e3a8a 0%, #1e3a8a 100%);
+              color: white;
+              padding: 30px;
+              text-align: center;
+              width: 100%;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              margin-bottom: 20px;
+              border: 3px solid #1e3a8a;
+            }
+
+            .exam-header {
+              display: flex;
+              justify-content: space-between;
+              align-items: flex-start;
+              margin-bottom: 20px;
+              text-align: left;
+            }
+
+            .institution-info .university-name {
+              font-size: 10px;
+              font-weight: 800;
+              margin-bottom: 5px;
+              text-transform: uppercase;
+              letter-spacing: 3px;
+              text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+              background: linear-gradient(45deg, #ffffff, #f0f8ff);
+              -webkit-background-clip: text;
+              -webkit-text-fill-color: transparent;
+              background-clip: text;
+              font-family: 'Georgia', 'Times New Roman', serif;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+
+            .institution-info .department {
+              font-size: 12px;
+              font-weight: 400;
+              opacity: 0.9;
+            }
+
+            .exam-details {
+              text-align: right;
+              font-size: 10px;
+              line-height: 1.4;
+            }
+
+            .exam-session {
+              font-size: 10px;
+              font-weight: 700;
+              letter-spacing: 2px;
+              text-transform: uppercase;
+              color: rgba(255,255,255,0.95);
+              text-shadow: 1px 1px 3px rgba(0,0,0,0.4);
+              font-family: 'Georgia', 'Times New Roman', serif;
+              margin-bottom: 3px;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+
+            .exam-details div {
+              margin-bottom: 3px;
+            }
+
+            .exam-title-section {
+              text-align: center;
+              margin: 20px 0;
+              border-bottom: 2px solid rgba(255,255,255,0.3);
+              padding-bottom: 15px;
+            }
+
+            .title {
+              color: white;
+              font-size: 22px;
+              margin: 0 0 10px 0;
+              font-weight: 700;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              text-transform: uppercase;
+              letter-spacing: 1px;
+            }
+
+            .subtitle {
+              display: flex;
+              justify-content: space-between;
+              font-size: 12px;
+              margin-top: 10px;
+              font-weight: 500;
+              color: rgba(255,255,255,0.9);
+            }
+
+            .instructions-box {
+              background: rgba(255,255,255,0.95);
+              color: #1e3a8a;
+              padding: 20px;
+              margin: 20px 0;
+              border-radius: 8px;
+              text-align: left;
+            }
+
+            .instructions-box h3 {
+              margin: 0 0 15px 0;
+              font-size: 14px;
+              font-weight: 700;
+              text-align: center;
+              border-bottom: 2px solid #1e3a8a;
+              padding-bottom: 8px;
+            }
+
+            .instructions-list {
+              margin: 0 0 20px 0;
+              padding-left: 20px;
+            }
+
+            .instructions-list li {
+              margin-bottom: 8px;
+              font-size: 12px;
+              line-height: 1.4;
+            }
+
+            /* Question styling */
+            .question {
+              margin-bottom: 14px;
+              page-break-inside: avoid;
+              width: 100%;
+            }
+
+            .question-number {
+              color: #1e3a8a;
+              font-weight: bold;
+              font-size: 13px;
+              margin-bottom: 5px;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              width: 100%;
+            }
+
+            .question-text {
+              margin: 6px 0;
+              font-size: 14px;
+              width: 100%;
+            }
+
+            .answer-options {
+              margin: 10px 0;
+              width: 100%;
+            }
+
+            .option {
+              margin: 3px 0;
+              font-size: 14px;
+              width: 100%;
+              padding-left: 20px;
+            }
+
+            .answer-title {
+              color: #1e3a8a;
+              font-weight: bold;
+              margin: 10px 0 5px 0;
+              font-size: 13px;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              width: 100%;
+            }
+
+            .answer-content {
+              margin: 5px 0 10px 0;
+              padding-left: 12px;
+              border-left: 2px solid #1e3a8a;
+              color: #374151;
+              font-size: 14px;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              width: 100%;
+            }
+
+            .correct-answer {
+              color: #2b6b6e;
+              background-color: rgba(43, 107, 110, 0.1);
+              font-weight: 600;
+              padding: 8px 12px;
+              border-radius: 4px;
+              border-left: 4px solid #2b6b6e;
+              margin: 5px 0 10px 0;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              width: 100%;
+            }
+
+            .rationale {
+              background-color: #fafbff;
+              padding: 8px 12px;
+              border-radius: 4px;
+              margin: 8px 0;
+              border-left: 3px solid #2b6b6e;
+              font-size: 13px;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+              width: 100%;
+            }
+
+            .answer-lines {
+              margin-top: 15px;
+              margin-bottom: 20px;
+            }
+
+            .answer-line {
+              border-bottom: 1px solid #1e3a8a;
+              height: 20px;
+              margin-bottom: 15px;
+            }
+            
+            hr {
+              border: 0;
+              height: 1px;
+              background: linear-gradient(to right, rgba(30, 58, 138, 0.08), rgba(30, 58, 138, 0.3), rgba(30, 58, 138, 0.08));
+              margin: 12px 0;
+              width: 100%;
+            }
+            
+            /* Exam footer elements */
+            .exam-footer {
+              background: linear-gradient(135deg, #1e3a8a 0%, #1e3a8a 100%);
+              color: white;
+              padding: 20px;
+              border-radius: 8px;
+              margin: 40px 0 20px 0;
+              text-align: center;
+              width: 100%;
+              box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+              border: 2px solid #1e3a8a;
+              -webkit-print-color-adjust: exact;
+              print-color-adjust: exact;
+            }
+            
+            .exam-end-notice {
+              font-size: 18px;
+              margin-bottom: 15px;
+              font-weight: 700;
+              letter-spacing: 1px;
+            }
+
+            /* Print-specific styling */
+            @media print {
+              @page {
+                size: auto;
+                margin: 0.5in;
+                marks: none;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+              }
+
+              .content-container {
+                padding: 0 !important;
+                margin: 0 auto !important;
+                width: 100% !important;
+                max-width: 100% !important;
+              }
+
+              .rationale {
+                page-break-inside: avoid !important;
+                break-inside: avoid-page !important;
+                width: 100% !important;
+              }
+              
+              .question, .question-number, .question-text, 
+              .answer-title, .answer-content {
+                width: 100% !important;
+              }
+
+              * {
+                -webkit-print-color-adjust: exact !important;
+                print-color-adjust: exact !important;
+                color-adjust: exact !important;
+              }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="content-container">
+            <div class="header">
+              <div class="exam-header">
+                <div class="institution-info">
+                  <div class="university-name">PREMIUM STUDY MATERIALS</div>
+                </div>
+                <div class="exam-details">
+                  <div class="exam-session">STUDY COLLECTION: ${new Date().getFullYear()}</div>
+                </div>
+              </div>
+              
+              <div class="exam-title-section">
+                <h1 class="title">${examTitle || "Exam"}</h1>
+              </div>
+              
+              <div class="instructions-box">
+                <h3>WHAT'S INSIDE:</h3>
+                <ul class="instructions-list">
+                  <li>Latest 2025/2026 Questions</li>
+                  <li>Verified Correct Answers Highlighted for Easy Learning</li>
+                  <li>Detailed Explanations & Rationales for Better Understanding</li>
+                  <li>Proven to Boost Grades and Exam Confidence</li>
+                  <li>Covers All Essential Topics and Core Concepts</li>
+                  <li>Perfect for Quick Revision and Last-Minute Review</li>
+                </ul>
+              </div>
+            </div>
+                    
+            ${questions
+              .map(
+                (question, index) => `
+              <div class="question">
+                <div class="question-number">Question ${index + 1}</div>
+                <div class="question-text">${question.questionText}</div>
+                
+                ${
+                  question.questionType === "multiple_choice" ||
+                  question.questionType === "true_false"
+                    ? `
+                  <div class="answer-options">
+                    ${question.optionA ? `<div class="option">A. ${question.optionA}</div>` : ""}
+                    ${question.optionB ? `<div class="option">B. ${question.optionB}</div>` : ""}
+                    ${question.optionC ? `<div class="option">C. ${question.optionC}</div>` : ""}
+                    ${question.optionD ? `<div class="option">D. ${question.optionD}</div>` : ""}
+                  </div>
+                `
+                    : ""
+                }
+                
+                ${
+                  question.questionType === "short_answer" &&
+                  (version === "student" || version === "combined")
+                    ? `
+                  <div class="answer-lines">
+                    <div class="answer-line"></div>
+                    <div class="answer-line"></div>
+                    <div class="answer-line"></div>
+                  </div>
+                `
+                    : ""
+                }
+                
+                ${
+                  version === "teacher" || version === "combined"
+                    ? `
+                  <div class="answer-title">Correct Answer</div>
+                  <div class="correct-answer">${question.correctAnswer}</div>
+                  ${
+                    question.rationale
+                      ? `
+                    <div class="rationale">
+                      <strong>Rationale:</strong><br>
+                      <em style="font-size: 0.9em; color: #374151;">${question.rationale}</em>
+                    </div>
+                  `
+                      : ""
+                  }
+                `
+                    : ""
+                }
+              </div>
+              ${index < questions.length - 1 ? "<hr>" : ""}
+            `
+              )
+              .join("")}
+            
+            <div class="exam-footer">
+              <div class="footer-content">
+                <div class="exam-end-notice">
+                  <strong>KEEP LEARNING!</strong>
+                </div>
+              </div>
+            </div>
+          </div>
+        </body>
+      </html>
+    `;
+
+    // Write content to the new window and print
+    printWindow.document.write(printContent);
+    printWindow.document.close();
+
+    // Set the document title for saving with proper filename
+    const filename = `${cleanTitle.replace(/\s+/g, "_")}`;
+    printWindow.document.title = filename;
+
+    // Wait for content to load then print
+    printWindow.onload = () => {
+      setTimeout(() => {
+        printWindow.print();
+        printWindow.close();
+      }, 250);
+    };
+
+    toast.success(
+      `${version === "student" ? "Student" : version === "teacher" ? "Teacher" : "Teacher and Student"} version sent to printer`
+    );
+  };
+
+  if (isPending) {
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary mx-auto"></div>
+          <p className="mt-4 text-muted-foreground">Loading...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!session?.user) {
+    return null;
+  }
+
+  return (
+    <SidebarProvider>
+      <div className="flex min-h-screen w-full">
+        <Sidebar>
+          <SidebarContent>
+            <div className="p-4 border-b">
+              <h2 className="text-xl font-bold flex items-center gap-2">
+                <Sparkles className="h-5 w-5" />
+                ExamForge
+              </h2>
+            </div>
+            <SidebarGroup>
+              <SidebarGroupLabel>Navigation</SidebarGroupLabel>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton asChild>
+                      <a href="/dashboard">
+                        <Home className="h-4 w-4" />
+                        <span>Dashboard</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton asChild>
+                      <a href="/history">
+                        <History className="h-4 w-4" />
+                        <span>Exam History</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+            <SidebarGroup className="mt-auto">
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton onClick={handleSignOut}>
+                      <LogOut className="h-4 w-4" />
+                      <span>Sign Out</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          </SidebarContent>
+        </Sidebar>
+
+        <main className="flex-1 min-w-0 p-4 md:p-6 bg-background overflow-x-hidden">
+          <div className="max-w-full">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 mb-6">
+              <SidebarTrigger />
+              <div className="flex-1 min-w-0">
+                <h1 className="text-2xl md:text-3xl font-bold truncate">
+                  AI Exam Generator
+                </h1>
+                <p className="text-muted-foreground truncate">
+                  Welcome back, {session.user.name || session.user.email}
+                </p>
+              </div>
+              {questions.length > 0 && (
+                <Button
+                  onClick={handleSaveExam}
+                  disabled={isSaving || !!loadedExamId}
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                >
+                  {isSaving ? (
+                    <>
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-foreground mr-2"></div>
+                      Saving...
+                    </>
+                  ) : loadedExamId ? (
+                    <>
+                      <Save className="h-4 w-4 mr-2" />
+                      Saved
+                    </>
+                  ) : (
+                    <>
+                      <Save className="h-4 w-4 mr-2" />
+                      Save Exam
+                    </>
+                  )}
+                </Button>
+              )}
+            </div>
+
+            <div className="grid gap-6 lg:grid-cols-2">
+              {/* Configuration Card */}
+              <Card className="min-w-0">
+                <CardHeader>
+                  <CardTitle>Exam Configuration</CardTitle>
+                  <CardDescription>Set up your exam parameters</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="examTitle">Exam Title *</Label>
+                    <Input
+                      id="examTitle"
+                      placeholder="e.g., Biology Mid-term"
+                      value={examTitle}
+                      onChange={(e) => setExamTitle(e.target.value)}
+                      className="w-full"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="subject">Subject *</Label>
+                    <Input
+                      id="subject"
+                      placeholder="e.g., Biology, Mathematics"
+                      value={subject}
+                      onChange={(e) => setSubject(e.target.value)}
+                      className="w-full"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="coreTestingAreas">Core Testing Areas *</Label>
+                    <Textarea
+                      id="coreTestingAreas"
+                      placeholder="Enter core testing areas, one per line:&#10;• Respiratory Disorders & Acute Complications&#10;• Cardiovascular Disorders & Emergency Response&#10;• Neurological Conditions & Crisis Management&#10;• Endocrine Emergencies & Diabetes Regulation"
+                      value={coreTestingAreas}
+                      onChange={(e) => setCoreTestingAreas(e.target.value)}
+                      className="w-full min-h-[120px]"
+                      rows={6}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      List the main topics/areas this exam should cover. These will be used to generate both the cover page and ensure questions cover all specified areas.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="difficulty">Difficulty Level</Label>
+                    <Select value={difficulty} onValueChange={setDifficulty}>
+                      <SelectTrigger id="difficulty" className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="hybrid">
+                          Hybrid (Recommended)
+                        </SelectItem>
+                        <SelectItem value="easy">Easy</SelectItem>
+                        <SelectItem value="medium">Medium</SelectItem>
+                        <SelectItem value="hard">Hard</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="questionLength">Question Length</Label>
+                    <div className="space-y-3">
+                      <Slider
+                        id="questionLength"
+                        min={0}
+                        max={2}
+                        step={1}
+                        value={[questionLength === "short" ? 0 : questionLength === "medium" ? 1 : 2]}
+                        onValueChange={(value) => {
+                          const length = value[0] === 0 ? "short" : value[0] === 1 ? "medium" : "long";
+                          setQuestionLength(length);
+                        }}
+                        className="w-full"
+                      />
+                      <div className="flex justify-between text-sm text-muted-foreground">
+                        <span>Short</span>
+                        <span>Medium</span>
+                        <span>Long</span>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        {questionLength === "short" && "Concise questions with brief explanations"}
+                        {questionLength === "medium" && "Balanced questions with moderate detail"}
+                        {questionLength === "long" && "Detailed questions with comprehensive explanations"}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="numQuestions">Number of Questions</Label>
+                    <Input
+                      id="numQuestions"
+                      type="number"
+                      min="1"
+                      max="100"
+                      value={numQuestions}
+                      onChange={(e) =>
+                        setNumQuestions(parseInt(e.target.value) || 100)
+                      }
+                      className="w-full"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Recommended: 60-80 questions for optimal generation
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="model">AI Model</Label>
+                    <Select
+                      value={selectedModel}
+                      onValueChange={setSelectedModel}
+                    >
+                      <SelectTrigger id="model" className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="llama-3.1-8b-instant">
+                          Llama 3.1 8B Instant (Fastest)
+                        </SelectItem>
+                        <SelectItem value="llama-3.3-70b-versatile">
+                          Llama 3.3 70B Versatile (Recommended)
+                        </SelectItem>
+                        <SelectItem value="meta-llama/llama-guard-4-12b">
+                          Llama Guard 4 12B
+                        </SelectItem>
+                        <SelectItem value="openai/gpt-oss-20b">
+                          GPT OSS 20B
+                        </SelectItem>
+                        <SelectItem value="openai/gpt-oss-120b">
+                          GPT OSS 120B (Most Powerful)
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      Choose the AI model for question generation. Higher
+                      capacity models provide better quality.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label>Question Types</Label>
+                    <div className="space-y-2">
+                      <div className="flex items-center space-x-2">
+                        <Checkbox
+                          id="multiple_choice"
+                          checked={questionTypes.multiple_choice}
+                          onCheckedChange={(checked) =>
+                            setQuestionTypes((prev) => ({
+                              ...prev,
+                              multiple_choice: checked as boolean,
+                            }))
+                          }
+                        />
+                        <label
+                          htmlFor="multiple_choice"
+                          className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                        >
+                          Multiple Choice
+                        </label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <Checkbox
+                          id="true_false"
+                          checked={questionTypes.true_false}
+                          onCheckedChange={(checked) =>
+                            setQuestionTypes((prev) => ({
+                              ...prev,
+                              true_false: checked as boolean,
+                            }))
+                          }
+                        />
+                        <label
+                          htmlFor="true_false"
+                          className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                        >
+                          True/False
+                        </label>
+                      </div>
+                      <div className="flex items-center space-x-2">
+                        <Checkbox
+                          id="short_answer"
+                          checked={questionTypes.short_answer}
+                          onCheckedChange={(checked) =>
+                            setQuestionTypes((prev) => ({
+                              ...prev,
+                              short_answer: checked as boolean,
+                            }))
+                          }
+                        />
+                        <label
+                          htmlFor="short_answer"
+                          className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+                        >
+                          Short Answer
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+
+              {/* Source Material Card */}
+              <Card className="min-w-0">
+                <CardHeader>
+                  <CardTitle>Source Material (Optional)</CardTitle>
+                  <CardDescription>
+                    Upload files or paste context for question generation
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="fileUpload">
+                      Upload Files (PDF, TXT, DOCX)
+                    </Label>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        id="fileUpload"
+                        type="file"
+                        accept=".txt,.md,.pdf,.docx"
+                        onChange={handleFileUpload}
+                        disabled={isProcessingFiles}
+                        multiple
+                        className="flex-1 min-w-0"
+                      />
+                      <FileUp className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                    </div>
+                    {isProcessingFiles && (
+                      <p className="text-sm text-muted-foreground flex items-center gap-2">
+                        <div className="animate-spin rounded-full h-3 w-3 border-b-2 border-foreground"></div>
+                        Processing files...
+                      </p>
+                    )}
+                    {sourceFiles.length > 0 && (
+                      <div className="space-y-1 mt-2">
+                        <p className="text-sm font-medium">
+                          Uploaded files ({sourceFiles.length}):
+                        </p>
+                        {sourceFiles.map((file, index) => (
+                          <div
+                            key={index}
+                            className="flex items-center justify-between gap-2 text-sm text-muted-foreground bg-muted px-3 py-2 rounded-md min-w-0"
+                          >
+                            <span className="truncate flex-1">{file.name}</span>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => handleRemoveFile(index)}
+                              className="h-6 w-6 p-0 flex-shrink-0"
+                            >
+                              <X className="h-3 w-3" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="context">Or Paste Context</Label>
+                    <Textarea
+                      id="context"
+                      placeholder="Paste your study material, lecture notes, or textbook content here..."
+                      value={context}
+                      onChange={(e) => setContext(e.target.value)}
+                      className="resize-none w-full h-40 overflow-y-auto"
+                    />
+                  </div>
+
+                  <div className="flex items-center space-x-2 mb-4">
+                    <Checkbox 
+                      id="enableStreaming" 
+                      checked={enableStreaming}
+                      onCheckedChange={(checked) => setEnableStreaming(!!checked)}
+                    />
+                    <Label htmlFor="enableStreaming" className="text-sm">
+                      Enable real-time generation (stream questions as they're created)
+                    </Label>
+                  </div>
+
+                  {isStreaming && (
+                    <div className="mb-4 p-4 bg-muted rounded-lg">
+                      <div className="flex flex-col space-y-2">
+                        <div className="flex justify-between text-sm">
+                          <span>{streamingStatus}</span>
+                          <span>{questionsGenerated}/{numQuestions} questions</span>
+                        </div>
+                        <div className="w-full bg-gray-200 rounded-full h-2">
+                          <div 
+                            className="bg-primary h-2 rounded-full transition-all duration-300"
+                            style={{ width: `${streamingProgress}%` }}
+                          ></div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* High Duplication Risk Warning */}
+                  {isHighDuplicationRisk(questionLength, difficulty, numQuestions, selectedModel) && (
+                    <Alert className="mb-4 border-orange-200 bg-orange-50">
+                      <AlertTriangle className="h-4 w-4 text-orange-600" />
+                      <AlertDescription className="text-orange-800">
+                        <strong>Duplication Risk Detected:</strong> {getRiskFactors(questionLength, difficulty, numQuestions, selectedModel).join(', ')} may increase duplicate questions. 
+                        Enhanced duplicate prevention is active. Consider using longer questions, higher difficulty, or fewer questions for best results.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+
+                  <Button
+                    onClick={enableStreaming ? handleGenerateQuestionsStreaming : handleGenerateQuestions}
+                    disabled={isGenerating || isProcessingFiles}
+                    className="w-full"
+                    size="lg"
+                  >
+                    {isGenerating ? (
+                      <>
+                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white mr-2"></div>
+                        {isStreaming ? "Streaming Questions..." : "Generating..."}
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="h-4 w-4 mr-2" />
+                        {enableStreaming ? "Stream Questions" : "Generate Questions"}
+                      </>
+                    )}
+                  </Button>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* Questions Preview */}
+            {/* Temporarily show always for debugging */}
+            <Card className="mt-6 min-w-0">
+              <CardHeader>
+                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                  <div>
+                    <CardTitle>
+                      Generated Questions (Debug: {questions.length} questions)
+                    </CardTitle>
+                    <CardDescription>
+                      {questions.length} questions generated
+                    </CardDescription>
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                    {questions.length > 0 && (
+                      <Button
+                        onClick={handleRemoveDuplicates}
+                        disabled={isRemovingDuplicates}
+                        variant="outline"
+                        className="text-sm mb-2 sm:mb-0"
+                      >
+                        <FilterX className="h-4 w-4 mr-1" />
+                        {isRemovingDuplicates ? "Removing..." : "Remove Duplicates"}
+                      </Button>
+                    )}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        onClick={() => handleExportPDF("student")}
+                        disabled={isExporting}
+                        variant="outline"
+                        className="text-sm"
+                      >
+                        <Download className="h-4 w-4 mr-1" />
+                        Download Student
+                      </Button>
+                      <Button
+                        onClick={() => handlePrint("student")}
+                        variant="outline"
+                        className="text-sm"
+                        disabled={questions.length === 0}
+                      >
+                        <Printer className="h-4 w-4 mr-1" />
+                        Print Student
+                      </Button>
+                      <Button
+                        onClick={() => handleExportPDF("teacher")}
+                        disabled={isExporting}
+                        className="text-sm"
+                      >
+                        <Download className="h-4 w-4 mr-1" />
+                        Download Teacher
+                      </Button>
+                      <Button
+                        onClick={() => handlePrint("teacher")}
+                        className="text-sm"
+                        disabled={questions.length === 0}
+                      >
+                        <Printer className="h-4 w-4 mr-1" />
+                        Print Teacher
+                      </Button>
+                    </div>
+                    <div className="col-span-2 mt-2">
+                      <Button
+                        onClick={() => handlePrint("combined")}
+                        variant="default"
+                        className="text-sm w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700"
+                        disabled={questions.length === 0}
+                      >
+                        <Printer className="h-4 w-4 mr-1" />
+                        Print Teacher and Student
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </CardHeader>
+              <CardContent className="overflow-x-auto">
+                <QuestionTable
+                  questions={questions}
+                  onQuestionsChange={setQuestions}
+                />
+              </CardContent>
+            </Card>
+          </div>
+        </main>
+      </div>
+      <Toaster />
+    </SidebarProvider>
+  );
+}

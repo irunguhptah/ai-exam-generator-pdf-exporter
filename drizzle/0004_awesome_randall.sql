@@ -1,0 +1,1 @@
+ALTER TABLE `exams` ADD `core_testing_areas` text DEFAULT '' NOT NULL;

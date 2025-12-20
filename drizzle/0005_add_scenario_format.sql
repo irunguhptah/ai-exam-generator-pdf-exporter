@@ -1,0 +1,1 @@
+ALTER TABLE `exams` ADD `scenario_format` text DEFAULT 'mixed' NOT NULL;

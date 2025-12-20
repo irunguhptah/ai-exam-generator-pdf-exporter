@@ -1,0 +1,30 @@
+/* Shared exam print/preview styles
+   Use this file in preview components and ensure export-pdf's inline CSS matches it.
+*/
+*{box-sizing:border-box}
+body{font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;margin:0;padding:0;background:#fafafa}
+
+.content-container{width:100%;padding:20px;margin:0 auto}
+.header{padding:30px;margin-bottom:20px}
+
+/* Keep headings plain (no highlight background) */
+.instructions-box{background:transparent;color:inherit;padding:12px 0;margin:12px 0}
+.exam-overview-section{background:transparent;color:inherit;padding:12px 0;margin:12px 0}
+.exam-sections-box{background:transparent;color:inherit;padding:12px 0;margin:12px 0}
+
+.exam-overview-section h3,.exam-sections-box h3,.instructions-box h3{margin:0 0 8px 0;font-size:14px;font-weight:600;text-align:left}
+
+.topics-covered{background:transparent;padding:8px 0;margin:8px 0 16px 0}
+.topics-covered h3{margin:0 0 6px 0;font-size:14px;font-weight:600}
+.topics-list{margin:0;padding-left:20px}
+.topics-list li{margin-bottom:6px;font-size:12px}
+
+.question{margin-bottom:14px;page-break-inside:avoid;break-inside:avoid-column}
+.question-number{font-weight:bold}
+
+@media print{
+  @page{size:auto;margin:0.5in}
+  .content-container{padding:20px !important}
+  .no-print{display:none !important}
+  *{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}
+}
