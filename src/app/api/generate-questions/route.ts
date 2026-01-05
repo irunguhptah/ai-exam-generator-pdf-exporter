@@ -104,7 +104,9 @@ async function attemptGroqCompletion(messages: any[], preferredModel: string, op
       
       // Add timeout to prevent hanging
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second timeout
+      // Increase timeout for large generations to 3 minutes
+      const timeoutMs = process.env.GROQ_TIMEOUT_MS ? Number(process.env.GROQ_TIMEOUT_MS) : 180000;
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
       
       const completion = await groq.chat.completions.create({
         messages,
@@ -124,6 +126,14 @@ async function attemptGroqCompletion(messages: any[], preferredModel: string, op
       console.warn(`Groq model attempt failed for '${m}': ${errMsg.substring ? errMsg.substring(0, 200) : errMsg}`);
 
       const isModelNotFound = errMsg && (errMsg.includes('model_not_found') || errMsg.includes('does not exist') || (err?.status === 404));
+      // If upstream returned a gateway timeout, surface a specific error so callers can return partial results
+      const isUpstream504 = (err?.status === 504) || (err?.response && err.response.status === 504) || errMsg.includes('504') || errMsg.includes('Gateway Timeout');
+      if (isUpstream504) {
+        const e = new Error('Upstream model gateway timeout (504)');
+        (e as any).isUpstream504 = true;
+        throw e;
+      }
+
       if (!isModelNotFound) {
         // For other errors, rethrow immediately to avoid hiding problems
         throw err;
@@ -1714,44 +1724,57 @@ async function generateDomainByDomainQuestions(params: {
       attempts++;
       const questionsNeeded = targetCount - domainQuestions.length;
       const batchSize = Math.min(questionsNeeded * 2, 10); // Generate extra to account for filtering
-      
+
       console.log(`📝 Domain ${domainName} - Attempt ${attempts}: Need ${questionsNeeded} more questions, generating batch of ${batchSize}`);
-      
-      // Generate questions specifically for this domain
-      const batchQuestions = await generateDomainSpecificQuestions({
-        domainName,
-        expandedDomain,
-        batchSize,
-        subject,
-        difficulty,
-        questionLength,
-        questionTypes,
-        selectedModel,
-        context,
-        scenarioFormat,
-        isHealthcareSubject,
-        existingQuestions: domainQuestions
-      });
-      
-      // Filter and validate questions for this domain
-      for (const newQuestion of batchQuestions) {
-        if (domainQuestions.length >= targetCount) break;
-        
-        // Check if this question is unique within the current domain
-        const testArray = [...domainQuestions, newQuestion];
-        const deduplicationResult = removeDuplicates(testArray, duplicationContext);
-        const isDuplicateInDomain = deduplicationResult.unique.length === domainQuestions.length;
-        
-        if (!isDuplicateInDomain) {
-          domainQuestions.push(newQuestion);
-          console.log(`✅ Domain ${domainName}: Added unique question ${domainQuestions.length}/${targetCount}`);
-        } else {
-          console.log(`❌ Domain ${domainName}: Rejected duplicate question`);
+
+      try {
+        // Generate questions specifically for this domain
+        const batchQuestions = await generateDomainSpecificQuestions({
+          domainName,
+          expandedDomain,
+          batchSize,
+          subject,
+          difficulty,
+          questionLength,
+          questionTypes,
+          selectedModel,
+          context,
+          scenarioFormat,
+          isHealthcareSubject,
+          existingQuestions: domainQuestions
+        });
+
+        // Filter and validate questions for this domain
+        for (const newQuestion of batchQuestions) {
+          if (domainQuestions.length >= targetCount) break;
+
+          // Check if this question is unique within the current domain
+          const testArray = [...domainQuestions, newQuestion];
+          const deduplicationResult = removeDuplicates(testArray, duplicationContext);
+          const isDuplicateInDomain = deduplicationResult.unique.length === domainQuestions.length;
+
+          if (!isDuplicateInDomain) {
+            domainQuestions.push(newQuestion);
+            console.log(`✅ Domain ${domainName}: Added unique question ${domainQuestions.length}/${targetCount}`);
+          } else {
+            console.log(`❌ Domain ${domainName}: Rejected duplicate question`);
+          }
         }
-      }
-      
-      if (batchQuestions.length === 0) {
-        console.warn(`⚠️ Domain ${domainName}: No questions generated in batch, breaking loop`);
+
+        if (batchQuestions.length === 0) {
+          console.warn(`⚠️ Domain ${domainName}: No questions generated in batch`);
+        }
+      } catch (err: any) {
+        // If a transient upstream 504 occurred, apply exponential backoff and retry
+        if (err?.isUpstream504 || (err?.message && err.message.includes('Upstream model gateway timeout'))) {
+          const backoffMs = Math.min(60000, 2000 * Math.pow(2, attempts)); // cap at 60s
+          console.warn(`🚧 Transient upstream error for domain ${domainName}: ${err.message || err}. Backing off ${backoffMs}ms and retrying (attempt ${attempts}/${maxAttempts})`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+          continue; // retry
+        }
+
+        console.error(`Domain ${domainName}: Generation failed with non-retryable error:`, err?.message || err);
+        // For non-transient errors, break to avoid tight loop
         break;
       }
     }
@@ -1990,8 +2013,12 @@ RESPONSE FORMAT: Return ONLY a valid JSON array with ${batchSize} questions. No 
     
     return validQuestions;
     
-  } catch (error) {
-    console.error(`Error generating domain-specific questions for ${domainName}:`, error);
+  } catch (error: any) {
+    console.error(`Error generating domain-specific questions for ${domainName}:`, error?.message || error);
+    // If upstream gateway timeout, rethrow so caller can perform retries/backoff
+    if (error?.isUpstream504 || (error?.message && error.message.includes('Upstream model gateway timeout'))) {
+      throw error;
+    }
     return [];
   }
 }

@@ -99,3 +99,13 @@ export const verification = sqliteTable("verification", {
     () => new Date(),
   ),
 });
+
+// Idempotency keys to avoid duplicate inserts on retries
+export const idempotency_keys = sqliteTable('idempotency_keys', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  key: text('key').notNull().unique(),
+  examId: integer('exam_id').references(() => exams.id),
+  domain: text('domain'),
+  metadata: text('metadata'),
+  createdAt: text('created_at').notNull(),
+});

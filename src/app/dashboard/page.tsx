@@ -362,6 +362,7 @@ export default function DashboardPage() {
           }
         }));
 
+        // Use streaming API to generate this domain so we receive incremental updates
         const requestBody = {
           examTitle,
           subject,
@@ -373,11 +374,11 @@ export default function DashboardPage() {
           questionTypes: selectedQuestionTypes,
           scenarioFormat,
           model: selectedModel,
-          stream: false,
+          stream: true,
           domainDistribution: { [domain]: Number(count) },
         };
 
-        console.log(`📤 Requesting domain ${domain}: ${count} questions`);
+        console.log(`📤 Requesting (stream) domain ${domain}: ${count} questions`);
 
         const response = await fetch('/api/generate-questions', {
           method: 'POST',
@@ -388,19 +389,16 @@ export default function DashboardPage() {
           body: JSON.stringify(requestBody),
         });
 
-        if (!response.ok) {
+        if (!response.ok || !response.body) {
           const errText = await response.text();
-          console.error(`❌ Error generating domain ${domain} (${response.status}):`, errText);
-          
-          // Handle authentication errors specifically
+          console.error(`❌ Error starting stream for domain ${domain} (${response.status}):`, errText);
           if (response.status === 401) {
             toast.error('Authentication failed. Please sign in again.');
             router.push('/sign-in');
             return;
           }
-          
-          toast.error(`Failed to generate questions for ${domain}: ${response.status}`);
-          // Mark as failed in progress
+
+          toast.error(`Failed to start streaming generation for ${domain}: ${response.status}`);
           setPerDomainProgress(prev => ({
             ...prev,
             [domain]: {
@@ -412,38 +410,199 @@ export default function DashboardPage() {
           continue;
         }
 
-        const result = await response.json();
-        const domainQuestions = result?.questions || [];
-        const blueprintForDomain = result?.metadata?.domainBlueprints ? (result.metadata.domainBlueprints[domain] || Object.values(result.metadata.domainBlueprints)[0]) : undefined;
+        // Stream with retry/backoff in case of transient failures
+        let streamAttempts = 0;
+        const maxStreamAttempts = 4;
+        let streamSucceeded = false;
+        let generatedSoFar = 0;
 
-        // Attach domain metadata if not already present
-        const withDomain = domainQuestions.map((q: any, idx: number) => ({ 
-          ...q,
-          domain,
-          domainIndex: i,
-          questionInDomain: idx + 1
-        }));
+        let blueprintForDomain: any = undefined;
+        
+        while (streamAttempts < maxStreamAttempts && generatedSoFar < Number(count)) {
+          streamAttempts++;
+          const remaining = Math.max(1, Number(count) - generatedSoFar);
+          const streamRequestBody = { ...requestBody, numQuestions: remaining };
+
+          try {
+            const streamResponse = await fetch('/api/generate-questions', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+              },
+              body: JSON.stringify(streamRequestBody),
+            });
+
+            if (!streamResponse.ok || !streamResponse.body) {
+              const errText = await streamResponse.text();
+              throw new Error(`Stream start failed: ${streamResponse.status} ${errText}`);
+            }
+
+            // Read SSE stream
+            const reader = streamResponse.body.getReader();
+            setStreamReader(reader);
+            const decoder = new TextDecoder();
+            let buffer = '';
+            const domainAccumulated: any[] = [];
+
+            const flushDomainBuffer = async (force = false) => {
+              if (domainAccumulated.length === 0) return;
+              const toSave = domainAccumulated.splice(0, force ? domainAccumulated.length : 10);
+              try {
+                await saveDomainQuestionsImmediate(domain, toSave);
+                console.log(`✅ Persisted batch of ${toSave.length} questions for ${domain}`);
+              } catch (err) {
+                console.warn(`Failed to persist domain batch for ${domain}:`, err);
+                domainAccumulated.unshift(...toSave);
+              }
+            };
+
+            // Read loop
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                // Split by SSE record separator
+                const parts = buffer.split('\n\n');
+                buffer = parts.pop() || '';
+
+                for (const part of parts) {
+                  const line = part.trim();
+                  if (!line) continue;
+                  const dataPrefix = 'data:';
+                  const idx = line.indexOf(dataPrefix);
+                  const payload = idx !== -1 ? line.slice(idx + dataPrefix.length).trim() : line;
+                  try {
+                    const event = JSON.parse(payload);
+                    if (event.type === 'question') {
+                      const q = event.question;
+                      const withDomainItem = { ...q, domain, domainIndex: i, questionInDomain: (domainAccumulated.length + 1) };
+                      setQuestions(prev => [...prev, withDomainItem]);
+                      domainAccumulated.push(withDomainItem);
+                      cumulative += 1;
+                      generatedSoFar += 1;
+                      setQuestionsGenerated(cumulative);
+                      setStreamingProgress(Math.round((cumulative / numQuestions) * 100));
+
+                      // Flush immediately (per-question)
+                      if (domainAccumulated.length >= 1) await flushDomainBuffer();
+                    } else if (event.type === 'progress') {
+                      setStreamingStatus(event.message || `Generating ${domain}...`);
+                    } else if (event.type === 'global_deduplication') {
+                      console.log('Global deduplication info:', event);
+                    } else if (event.type === 'complete') {
+                      const finalQs = event.questions || [];
+                      for (const q of finalQs) {
+                        const withDomainItem = { ...q, domain, domainIndex: i, questionInDomain: (domainAccumulated.length + 1) };
+                        setQuestions(prev => [...prev, withDomainItem]);
+                        domainAccumulated.push(withDomainItem);
+                        cumulative += 1;
+                        generatedSoFar += 1;
+                      }
+                      blueprintForDomain = event.domainBlueprint || blueprintForDomain;
+                      await flushDomainBuffer(true);
+                    } else if (event.type === 'error') {
+                      throw new Error(event.message || 'Stream error');
+                    }
+                  } catch (err) {
+                    console.warn('Failed to parse stream payload:', payload.substring ? payload.substring(0,200) : payload, err);
+                  }
+                }
+              }
+            } catch (streamErr) {
+              // Close reader and rethrow to trigger retry/backoff
+              try { await reader.cancel(); } catch (_) {}
+              throw streamErr;
+            }
+
+            // Ensure any leftover questions persisted
+            await flushDomainBuffer(true);
+
+            // After finishing stream, derive domain questions from UI store
+            const domainQuestions = questions.filter(q => q.domain === domain && q.domainIndex === i);
+            const finalBlueprintForDomain = blueprintForDomain || undefined;
+            const finalWithDomain = domainQuestions.map((q: any, idx: number) => ({ ...q, domainIndex: i, questionInDomain: idx + 1 }));
+
+            // Append to UI immediately (may be redundant) and persist final domain
+            setQuestions(prev => [...prev, ...finalWithDomain]);
+            try {
+              await saveDomainQuestionsImmediate(domain, finalWithDomain);
+              console.log(`✅ Persisted ${finalWithDomain.length} questions for domain ${domain}`);
+            } catch (saveErr) {
+              console.warn(`Failed to persist domain ${domain}:`, saveErr);
+            }
+
+            // Update per-domain progress
+            setPerDomainProgress(prev => ({
+              ...prev,
+              [domain]: {
+                ...(prev[domain] || { generated: 0, target: Number(count) }),
+                generated: generatedSoFar,
+                blueprint: finalBlueprintForDomain
+              }
+            }));
+
+            streamSucceeded = true;
+            break; // exit retry loop for this domain
+          } catch (err: any) {
+            console.warn(`Stream attempt ${streamAttempts} for ${domain} failed:`, err?.message || err);
+            if (streamAttempts >= maxStreamAttempts) {
+              console.error(`Exceeded max stream attempts for domain ${domain}`);
+              setPerDomainProgress(prev => ({
+                ...prev,
+                [domain]: {
+                  ...(prev[domain] || { generated: 0, target: Number(count) }),
+                  generated: generatedSoFar,
+                  blueprint: { error: `Streaming failed after ${streamAttempts} attempts` }
+                }
+              }));
+              // Persist whatever we have locally
+              try { await saveDomainQuestionsImmediate(domain, questions.filter(q => q.domain === domain)); } catch(_) {}
+              break;
+            }
+
+            const backoffMs = Math.min(60000, 1000 * Math.pow(2, streamAttempts));
+            console.log(`Retrying stream for ${domain} in ${backoffMs}ms...`);
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            continue; // retry
+          }
+        }
+
+        // After finishing stream, derive domain questions from UI store
+        const domainQuestions = questions.filter(q => q.domain === domain && q.domainIndex === i);
+        const finalBlueprintForDomain = blueprintForDomain || undefined;
+        const finalWithDomain = domainQuestions.map((q: any, idx: number) => ({ ...q, domainIndex: i, questionInDomain: idx + 1 }));
 
         // Append to UI immediately
-        setQuestions(prev => [...prev, ...withDomain]);
+        setQuestions(prev => [...prev, ...finalWithDomain]);
+
+        // Immediately persist this domain's questions to avoid losing progress
+        try {
+          await saveDomainQuestionsImmediate(domain, finalWithDomain);
+          console.log(`✅ Persisted ${finalWithDomain.length} questions for domain ${domain}`);
+        } catch (saveErr) {
+          console.warn(`Failed to persist domain ${domain}:`, saveErr);
+        }
 
         // Update per-domain progress with generated count and blueprint
         setPerDomainProgress(prev => ({
           ...prev,
           [domain]: {
             ...(prev[domain] || { generated: 0, target: Number(count) }),
-            generated: withDomain.length,
-            blueprint: blueprintForDomain
+            generated: finalWithDomain.length,
+            blueprint: finalBlueprintForDomain
           }
         }));
 
-        cumulative += withDomain.length;
+        cumulative += finalWithDomain.length;
         setQuestionsGenerated(cumulative);
         setStreamingProgress(Math.round((cumulative / numQuestions) * 100));
-        console.log(`✅ Generated ${withDomain.length}/${count} questions for ${domain}`);
+        console.log(`✅ Generated ${finalWithDomain.length}/${count} questions for ${domain}`);
         
         // Update status to show completion of this domain
-        setStreamingStatus(`✅ Completed ${domain}: ${withDomain.length} questions generated`);
+        setStreamingStatus(`✅ Completed ${domain}: ${finalWithDomain.length} questions generated`);
         
         // Small delay to show the completion status
         await new Promise(resolve => setTimeout(resolve, 500));
@@ -1182,6 +1341,54 @@ export default function DashboardPage() {
       }
     } catch (error) {
       console.warn("Auto-save error (non-critical):", error);
+    }
+  };
+
+  // Persist a single domain's questions immediately (create exam if needed, otherwise append)
+  const saveDomainQuestionsImmediate = async (domainName: string, domainQuestions: any[]) => {
+    if (!examTitle.trim() || domainQuestions.length === 0) return;
+
+    try {
+      const token = getToken();
+
+      const examData: any = {
+        title: examTitle,
+        subject: subject,
+        coreTestingAreas,
+        difficulty,
+        questionLength,
+        scenarioFormat,
+        numQuestions,
+        questions: domainQuestions,
+        userId: session?.user?.id,
+        update: loadedExamId ? true : false,
+        examId: loadedExamId || undefined,
+        // Attach domain metadata so backend can mark domain on questions
+      };
+
+      const response = await fetch('/api/exams', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify(examData),
+      });
+
+      if (!response.ok) {
+        const txt = await response.text();
+        throw new Error(`Failed to persist domain ${domainName}: ${response.status} ${txt}`);
+      }
+
+      const result = await response.json();
+      if (result && result.exam && result.exam.id) {
+        if (!loadedExamId) setLoadedExamId(result.exam.id);
+      } else if (result && result.id && !loadedExamId) {
+        setLoadedExamId(result.id);
+      }
+    } catch (error: any) {
+      console.warn('saveDomainQuestionsImmediate error:', error.message || error);
+      throw error;
     }
   };
 
